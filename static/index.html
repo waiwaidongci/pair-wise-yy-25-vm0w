@@ -1,8 +1,41 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>语料标注与仲裁</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;background:#f6f7f9}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}button{background:#235347;color:#fff}pre{white-space:pre-wrap;max-height:360px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}</style>
+<style>body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;background:#f6f7f9}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}button{background:#235347;color:#fff}button.warn{background:#8a3b2e}pre{white-space:pre-wrap;max-height:420px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}.todo{border-left:4px solid #c87a2e;padding:6px 10px;margin:6px 0;background:#fdf6ee}.ok{border-left:4px solid #2e7d32;background:#eef7ee}.muted{color:#777}</style>
 <h1>语料标注与争议仲裁</h1><section><button onclick="load()">刷新状态</button><pre id="state"></pre></section>
 <section><h2>标注与讨论</h2><div class="grid"><input id="item" type="number" placeholder="条目 ID"><input id="user" type="number" placeholder="用户 ID"><input id="label" placeholder="标签"><textarea id="comment" placeholder="备注"></textarea><input id="batch" type="number" placeholder="批次 ID"><input id="manager" type="number" placeholder="管理员 ID"></div>
 <button onclick="annotate()">提交标注</button><button onclick="loadItem()">查看条目与讨论可见性</button><button onclick="disagreements()">查看分歧</button><button onclick="consistency()">一致性</button><button onclick="freeze()">冻结金标准</button><pre id="result"></pre></section>
+<section><h2>指南换版（可中断，待补标补齐后生效）</h2>
+<p class="muted">管理员为未冻结批次提交新版指南与适用范围；系统按最新结果实时重算待补标清单，旧结论不计入新指南。</p>
+<div class="grid"><input id="gc_batch" type="number" placeholder="批次 ID"><input id="gc_manager" type="number" placeholder="管理员 ID"><input id="gc_to" type="number" placeholder="新指南 ID"><input id="gc_scope" placeholder="范围：all 或 条目ID,ID"></div>
+<button onclick="gcSubmit()">提交换版</button><button onclick="gcGet()">查看当前换版 / 待办</button><button onclick="gcConfirm()">确认生效</button><button class="warn" onclick="gcCancel()">取消换版</button>
+<div id="gc_view"></div><pre id="gc_result"></pre></section>
 <section><h2>仲裁</h2><input id="arb" type="number" placeholder="仲裁员 ID"><input id="final" placeholder="最终标签"><input id="reason" placeholder="理由至少5字"><button onclick="adjudicate()">提交仲裁</button></section>
-<script>const result=document.querySelector('#result');const show=x=>result.textContent=JSON.stringify(x,null,2);async function get(u){return show(await(await fetch(u)).json())}async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}async function load(){show(await(await fetch('/api/state')).json())}function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}function consistency(){get('/api/batches/'+batch.value+'/consistency')}function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}load()</script>
+<script>
+const result=document.querySelector('#result');
+const show=x=>result.textContent=JSON.stringify(x,null,2);
+async function get(u){return show(await(await fetch(u)).json())}
+async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}
+async function load(){show(await(await fetch('/api/state')).json())}
+function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}
+function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}
+function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}
+function consistency(){get('/api/batches/'+batch.value+'/consistency')}
+function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}
+function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}
+function scopeVal(){const v=gc_scope.value.trim();if(!v||v==='all')return null;return v.split(',').map(s=>+s.trim()).filter(n=>!Number.isNaN(n));}
+function gcSubmit(){post('/api/batches/'+gc_batch.value+'/guideline-changes',{manager_id:+gc_manager.value,to_guideline_id:+gc_to.value,scope_item_ids:scopeVal()})}
+function gcConfirm(){post('/api/batches/'+gc_batch.value+'/guideline-change/confirm',{manager_id:+gc_manager.value})}
+function gcCancel(){post('/api/batches/'+gc_batch.value+'/guideline-change/cancel',{manager_id:+gc_manager.value})}
+async function gcGet(){const r=await(await fetch('/api/batches/'+gc_batch.value+'/guideline-change')).json();const v=document.querySelector('#gc_view');document.querySelector('#gc_result').textContent=JSON.stringify(r,null,2);if(!r||!r.change){v.innerHTML='<p class="muted">当前批次无换版单。</p>';return;}
+const c=r.change;const scope=r.scope_all?'全部条目':'条目 '+r.scope_item_ids.join(', ');
+let html='<p>状态：<b>'+r.status+'</b>　版本差异：<b>'+(r.from_guideline.version||'?')+'</b> → <b>'+(r.to_guideline.version||'?')+'</b>　范围：'+scope+'　修订号：'+r.revision+'</p>';
+html+='<p class="muted">原指南：'+r.from_guideline.rules+'</p><p class="muted">新指南：'+r.to_guideline.rules+'</p>';
+if(r.status==='pending'){html+='<p>待补标清单（按最新结果实时重算）：</p>';
+if(!r.todos.length){html+='<p class="muted">范围内无条目。</p>';}
+r.todos.forEach(t=>{html+='<div class="'+(t.ready?'ok':'todo')+'"><b>条目 '+t.ordinal+'</b>（#'+t.item_id+'）：新版已交 '+t.annotation_count+' 份，标签 '+JSON.stringify(t.labels)+(t.has_adjudication?'，已仲裁':'')+'；旧版已交 '+t.previous_annotation_count+' 份（不计入新版）<br>'+(t.ready?'<span style="color:#2e7d32">已就绪</span>':t.reasons.map(x=>'· '+x).join('<br>')+'</div>');});
+html+='<p>'+(r.all_ready?'<span style="color:#2e7d32">全部补齐，可确认生效。</span>':'<span style="color:#8a3b2e">仍有待补标，生效会被拒绝。</span>')+'</p>';}
+else if(r.status==='applied'){html+='<p class="ok">已于 '+c.applied_at+' 生效（管理员 #'+c.applied_by+'）。</p>';}
+else{html+='<p class="muted">已于 '+c.cancelled_at+' 取消。</p>';}
+v.innerHTML=html;}
+load()
+</script>
 </html>

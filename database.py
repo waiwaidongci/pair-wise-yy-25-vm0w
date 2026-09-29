@@ -85,12 +85,13 @@ class CorpusDB:
             );
             CREATE TABLE IF NOT EXISTS adjudications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
               guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
               final_label TEXT NOT NULL,
               reason TEXT NOT NULL,
               arbitrator_id INTEGER NOT NULL REFERENCES users(id),
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              UNIQUE(item_id, guideline_id)
             );
             CREATE TABLE IF NOT EXISTS discussions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,9 +117,62 @@ class CorpusDB:
               frozen_by INTEGER NOT NULL REFERENCES users(id),
               frozen_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS guideline_changes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+              from_guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+              to_guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+              scope_all INTEGER NOT NULL DEFAULT 0 CHECK(scope_all IN (0,1)),
+              scope_item_ids TEXT,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','applied','cancelled')),
+              revision INTEGER NOT NULL DEFAULT 0,
+              version INTEGER NOT NULL DEFAULT 0,
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              applied_by INTEGER REFERENCES users(id),
+              applied_at TEXT,
+              cancelled_by INTEGER REFERENCES users(id),
+              cancelled_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_guideline_changes_batch_status
+              ON guideline_changes(batch_id, status);
             """
         )
         self.conn.commit()
+        self._migrate_adjudications()
+
+    def _migrate_adjudications(self) -> None:
+        """Rebuild adjudications if an old single-column UNIQUE(item_id) table exists."""
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='adjudications'"
+        ).fetchone()
+        if not row or "UNIQUE(item_id, guideline_id)" in (row[0] or ""):
+            return
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.conn.execute(
+                """
+                CREATE TABLE adjudications_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                  guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+                  final_label TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+                  created_at TEXT NOT NULL,
+                  UNIQUE(item_id, guideline_id)
+                )
+                """
+            )
+            self.conn.execute(
+                "INSERT INTO adjudications_new(id,item_id,guideline_id,final_label,reason,arbitrator_id,created_at) "
+                "SELECT id,item_id,guideline_id,final_label,reason,arbitrator_id,created_at FROM adjudications"
+            )
+            self.conn.execute("DROP TABLE adjudications")
+            self.conn.execute("ALTER TABLE adjudications_new RENAME TO adjudications")
+            self.conn.commit()
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -199,7 +253,7 @@ class CorpusDB:
         if not label.strip():
             raise DomainError("标签不能为空")
         item = self.conn.execute(
-            "SELECT i.*, b.guideline_id, b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
+            "SELECT i.*, b.guideline_id AS batch_guideline_id, b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
         ).fetchone()
         assignment = self.conn.execute(
             "SELECT * FROM assignments WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
@@ -208,25 +262,27 @@ class CorpusDB:
             raise DomainError("只能提交已分配条目的标注")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能修改标注")
+        ann_gid = self._annotation_guideline_for_item(item["batch_id"], item_id)
         with self.transaction():
-            self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
+            self.conn.execute("DELETE FROM adjudications WHERE item_id=? AND guideline_id=?", (item_id, ann_gid))
             try:
                 cur = self.conn.execute(
                     "INSERT INTO annotations(item_id,annotator_id,guideline_id,label,comment,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, annotator_id, item["guideline_id"], label.strip(), comment.strip(), datetime.now().isoformat()),
+                    (item_id, annotator_id, ann_gid, label.strip(), comment.strip(), datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError:
-                cur = self.conn.execute(
+                self.conn.execute(
                     "UPDATE annotations SET label=?,comment=?,created_at=? WHERE item_id=? AND annotator_id=? AND guideline_id=?",
-                    (label.strip(), comment.strip(), datetime.now().isoformat(), item_id, annotator_id, item["guideline_id"]),
+                    (label.strip(), comment.strip(), datetime.now().isoformat(), item_id, annotator_id, ann_gid),
                 )
                 annotation_id = self.conn.execute(
                     "SELECT id FROM annotations WHERE item_id=? AND annotator_id=? AND guideline_id=?",
-                    (item_id, annotator_id, item["guideline_id"]),
+                    (item_id, annotator_id, ann_gid),
                 ).fetchone()["id"]
             else:
                 annotation_id = int(cur.lastrowid)
             self.conn.execute("UPDATE assignments SET status='submitted' WHERE id=?", (assignment["id"],))
+            self._bump_change_revision(item["batch_id"], item_id)
         return int(annotation_id)
 
     def add_discussion(self, item_id: int, author_id: int, body: str, contains_answer: bool = False) -> int:
@@ -245,14 +301,28 @@ class CorpusDB:
 
     def get_item_for_user(self, item_id: int, user_id: int) -> dict:
         item = self.conn.execute(
-            "SELECT i.id,i.batch_id,i.ordinal,i.text,g.version AS guideline_version,g.rules "
-            "FROM items i JOIN batches b ON b.id=i.batch_id JOIN guidelines g ON g.id=b.guideline_id WHERE i.id=?",
-            (item_id,),
+            "SELECT i.id,i.batch_id,i.ordinal,i.text FROM items i WHERE i.id=?", (item_id,)
         ).fetchone()
         if not item:
             raise DomainError("条目不存在")
+        eff_gid = self._annotation_guideline_for_item(item["batch_id"], item_id)
+        g = self.conn.execute("SELECT version,rules FROM guidelines WHERE id=?", (eff_gid,)).fetchone()
+        payload = {
+            "id": item["id"], "batch_id": item["batch_id"], "ordinal": item["ordinal"], "text": item["text"],
+            "guideline_id": eff_gid, "guideline_version": g["version"], "rules": g["rules"],
+        }
+        pending = self._pending_change(item["batch_id"])
+        if pending and item["id"] in self._change_scope_ids(pending):
+            payload["pending_change"] = {
+                "id": pending["id"], "status": pending["status"],
+                "to_guideline_id": pending["to_guideline_id"], "revision": pending["revision"],
+            }
+        else:
+            payload["pending_change"] = None
         own = self.conn.execute(
-            "SELECT id,label,comment,created_at FROM annotations WHERE item_id=? AND annotator_id=?", (item_id, user_id)
+            "SELECT id,label,comment,created_at,guideline_id FROM annotations "
+            "WHERE item_id=? AND annotator_id=? AND guideline_id=?",
+            (item_id, user_id, eff_gid),
         ).fetchone()
         revealed = own is not None
         discussions = []
@@ -263,8 +333,14 @@ class CorpusDB:
                 discussions.append({"id": row["id"], "author": row["name"], "body": "提交自己的标注后才能查看此讨论", "hidden": True})
             else:
                 discussions.append(dict(row))
-        payload = dict(item)
         payload["own_annotation"] = dict(own) if own else None
+        payload["own_annotations"] = [
+            dict(r) for r in self.conn.execute(
+                "SELECT a.id,a.label,a.comment,a.created_at,a.guideline_id,g.version AS guideline_version "
+                "FROM annotations a JOIN guidelines g ON g.id=a.guideline_id "
+                "WHERE a.item_id=? AND a.annotator_id=? ORDER BY a.id", (item_id, user_id),
+            ).fetchall()
+        ]
         payload["discussions"] = discussions
         return payload
 
@@ -272,18 +348,23 @@ class CorpusDB:
         batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not batch:
             raise DomainError("批次不存在")
+        effective = self._effective_guidelines(batch_id)
         result = []
         for item in self.conn.execute("SELECT * FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall():
+            eff_gid = effective.get(item["id"], batch["guideline_id"])
             rows = self.conn.execute(
                 "SELECT a.*,u.name FROM annotations a JOIN users u ON u.id=a.annotator_id "
                 "WHERE a.item_id=? AND a.guideline_id=? ORDER BY a.id",
-                (item["id"], batch["guideline_id"]),
+                (item["id"], eff_gid),
             ).fetchall()
             labels = {row["label"] for row in rows}
-            adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+            adj = self.conn.execute(
+                "SELECT * FROM adjudications WHERE item_id=? AND guideline_id=?", (item["id"], eff_gid)
+            ).fetchone()
             if len(rows) >= 2 and len(labels) > 1 and not adj:
                 result.append({
                     "item_id": item["id"], "ordinal": item["ordinal"], "text": item["text"],
+                    "guideline_id": eff_gid,
                     "labels": [dict(row) for row in rows],
                 })
         return result
@@ -291,13 +372,16 @@ class CorpusDB:
     def adjudicate(self, item_id: int, final_label: str, reason: str, arbitrator_id: int) -> int:
         user = self.conn.execute("SELECT role FROM users WHERE id=?", (arbitrator_id,)).fetchone()
         item = self.conn.execute(
-            "SELECT i.*,b.guideline_id,b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
+            "SELECT i.*,b.guideline_id AS batch_guideline_id,b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
         ).fetchone()
         if not item or not user or user["role"] != "arbitrator":
             raise DomainError("条目或仲裁员无效")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能重新仲裁")
-        rows = self.conn.execute("SELECT label FROM annotations WHERE item_id=?", (item_id,)).fetchall()
+        ann_gid = self._annotation_guideline_for_item(item["batch_id"], item_id)
+        rows = self.conn.execute(
+            "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item_id, ann_gid)
+        ).fetchall()
         if len(rows) < 2:
             raise DomainError("至少需要两份标注才能仲裁")
         if not final_label.strip() or len(reason.strip()) < 5:
@@ -306,29 +390,34 @@ class CorpusDB:
             try:
                 cur = self.conn.execute(
                     "INSERT INTO adjudications(item_id,guideline_id,final_label,reason,arbitrator_id,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
+                    (item_id, ann_gid, final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError:
-                cur = self.conn.execute(
-                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=?",
-                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id),
+                self.conn.execute(
+                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=? AND guideline_id=?",
+                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id, ann_gid),
                 )
-                adjudication_id = self.conn.execute("SELECT id FROM adjudications WHERE item_id=?", (item_id,)).fetchone()["id"]
+                adjudication_id = self.conn.execute(
+                    "SELECT id FROM adjudications WHERE item_id=? AND guideline_id=?", (item_id, ann_gid)
+                ).fetchone()["id"]
             else:
                 adjudication_id = int(cur.lastrowid)
+            self._bump_change_revision(item["batch_id"], item_id)
         return int(adjudication_id)
 
     def consistency(self, batch_id: int) -> dict:
         batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not batch:
             raise DomainError("批次不存在")
+        effective = self._effective_guidelines(batch_id)
         items = self.conn.execute("SELECT id,ordinal FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
         per_item, agreement_pairs, total_pairs = [], 0, 0
         label_totals: Counter[str] = Counter()
         all_annotation_count = 0
         for item in items:
+            eff_gid = effective.get(item["id"], batch["guideline_id"])
             labels = [r["label"] for r in self.conn.execute(
-                "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
+                "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], eff_gid)
             ).fetchall()]
             if len(labels) < 2:
                 per_item.append({"item_id": item["id"], "ordinal": item["ordinal"], "agreement": None, "annotations": len(labels)})
@@ -364,16 +453,20 @@ class CorpusDB:
             raise DomainError("批次或管理员无效")
         if batch["status"] == "frozen":
             raise DomainError("批次已冻结")
+        if self._pending_change(batch_id):
+            raise DomainError("批次有进行中的换版单，请先确认生效或取消后再冻结")
         items = self.conn.execute("SELECT id FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
         if not items:
             raise DomainError("空批次不能冻结")
         disagreements = self.disagreements(batch_id)
         if disagreements:
             raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
+        effective = self._effective_guidelines(batch_id)
         missing = []
         for item in items:
+            eff_gid = effective.get(item["id"], batch["guideline_id"])
             count = self.conn.execute(
-                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
+                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], eff_gid)
             ).fetchone()[0]
             if count < 2:
                 missing.append(item["id"])
@@ -383,17 +476,20 @@ class CorpusDB:
         frozen_at = datetime.now().isoformat()
         with self.transaction():
             for item in items:
+                eff_gid = effective.get(item["id"], batch["guideline_id"])
                 labels = [r["label"] for r in self.conn.execute(
-                    "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
+                    "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], eff_gid)
                 ).fetchall()]
-                adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+                adj = self.conn.execute(
+                    "SELECT * FROM adjudications WHERE item_id=? AND guideline_id=?", (item["id"], eff_gid)
+                ).fetchone()
                 if adj:
                     label, source, adj_id = adj["final_label"], "adjudication", adj["id"]
                 else:
                     label, source, adj_id = labels[0], "consensus", None
                 self.conn.execute(
                     "INSERT INTO gold_records(batch_id,item_id,guideline_id,label,source,adjudication_id,frozen_at) VALUES(?,?,?,?,?,?,?)",
-                    (batch_id, item["id"], batch["guideline_id"], label, source, adj_id, frozen_at),
+                    (batch_id, item["id"], eff_gid, label, source, adj_id, frozen_at),
                 )
             self.conn.execute(
                 "INSERT INTO batch_freezes(batch_id,metrics_json,frozen_by,frozen_at) VALUES(?,?,?,?)",
@@ -408,7 +504,8 @@ class CorpusDB:
             raise DomainError("只有已冻结批次可以导出金标准")
         freeze = self.conn.execute("SELECT * FROM batch_freezes WHERE batch_id=?", (batch_id,)).fetchone()
         rows = self.conn.execute(
-            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at FROM gold_records g JOIN items i ON i.id=g.item_id "
+            "SELECT g.item_id,i.ordinal,i.text,g.guideline_id,g.label,g.source,g.frozen_at "
+            "FROM gold_records g JOIN items i ON i.id=g.item_id "
             "WHERE g.batch_id=? ORDER BY i.ordinal", (batch_id,)
         ).fetchall()
         return {
@@ -416,10 +513,250 @@ class CorpusDB:
             "metrics": json.loads(freeze["metrics_json"]), "records": [dict(row) for row in rows],
         }
 
+    # ------------------------------------------------------------------
+    # 指南换版（可中断、可恢复的执行过程）
+    # ------------------------------------------------------------------
+
+    def _pending_change(self, batch_id: int):
+        return self.conn.execute(
+            "SELECT * FROM guideline_changes WHERE batch_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+
+    def _change_scope_ids(self, change) -> list[int]:
+        if not change:
+            return []
+        return [int(x) for x in json.loads(change["scope_item_ids"] or "[]")]
+
+    def _effective_guidelines(self, batch_id: int) -> dict[int, int]:
+        """Return {item_id: authoritative guideline_id} for every item in a batch."""
+        batch = self.conn.execute("SELECT guideline_id FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch:
+            return {}
+        eff = {
+            r["id"]: batch["guideline_id"]
+            for r in self.conn.execute("SELECT id FROM items WHERE batch_id=?", (batch_id,)).fetchall()
+        }
+        for ch in self.conn.execute(
+            "SELECT to_guideline_id, scope_item_ids FROM guideline_changes "
+            "WHERE batch_id=? AND status='applied' ORDER BY id",
+            (batch_id,),
+        ).fetchall():
+            for iid in json.loads(ch["scope_item_ids"] or "[]"):
+                if iid in eff:
+                    eff[iid] = ch["to_guideline_id"]
+        return eff
+
+    def _annotation_guideline_for_item(self, batch_id: int, item_id: int) -> int:
+        """Guideline version under which a new annotation/adjudication for this item is recorded."""
+        pending = self._pending_change(batch_id)
+        if pending and item_id in self._change_scope_ids(pending):
+            return pending["to_guideline_id"]
+        return self._effective_guidelines(batch_id).get(item_id) or self.conn.execute(
+            "SELECT guideline_id FROM batches WHERE id=?", (batch_id,)
+        ).fetchone()["guideline_id"]
+
+    def _bump_change_revision(self, batch_id: int, item_id: int) -> None:
+        """Invalidate any pending to-do list covering this item; it is recomputed on read."""
+        pending = self._pending_change(batch_id)
+        if pending and item_id in self._change_scope_ids(pending):
+            self.conn.execute(
+                "UPDATE guideline_changes SET revision=revision+1 WHERE id=? AND status='pending'",
+                (pending["id"],),
+            )
+
+    def _item_readiness(self, item_id: int, guideline_id: int) -> dict:
+        anns = self.conn.execute(
+            "SELECT annotator_id, label FROM annotations WHERE item_id=? AND guideline_id=? ORDER BY id",
+            (item_id, guideline_id),
+        ).fetchall()
+        labels = [r["label"] for r in anns]
+        adj = self.conn.execute(
+            "SELECT id FROM adjudications WHERE item_id=? AND guideline_id=?",
+            (item_id, guideline_id),
+        ).fetchone()
+        reasons = []
+        if len(anns) < 2:
+            reasons.append(f"缺少标注：已交 {len(anns)} 份，需至少 2 份")
+        if len(set(labels)) > 1 and not adj:
+            reasons.append("存在分歧未仲裁")
+        return {
+            "annotation_count": len(anns),
+            "labels": labels,
+            "has_adjudication": adj is not None,
+            "ready": not reasons,
+            "reasons": reasons,
+        }
+
+    def _change_todos(self, change) -> tuple[list[dict], bool]:
+        """Recompute the to-be-supplemented list from the latest annotations/adjudications."""
+        todos, all_ready = [], True
+        for iid in self._change_scope_ids(change):
+            item = self.conn.execute("SELECT id,ordinal,text FROM items WHERE id=?", (iid,)).fetchone()
+            if not item:
+                continue
+            state = self._item_readiness(iid, change["to_guideline_id"])
+            prev = self.conn.execute(
+                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=?",
+                (iid, change["from_guideline_id"]),
+            ).fetchone()[0]
+            todos.append({
+                "item_id": iid, "ordinal": item["ordinal"], "text": item["text"],
+                "previous_annotation_count": prev,
+                **state,
+            })
+            if not state["ready"]:
+                all_ready = False
+        return todos, all_ready
+
+    def _guideline_brief(self, guideline_id: int) -> dict:
+        row = self.conn.execute("SELECT id,version,rules FROM guidelines WHERE id=?", (guideline_id,)).fetchone()
+        return dict(row) if row else {"id": guideline_id, "version": None, "rules": None}
+
+    def submit_guideline_change(
+        self, batch_id: int, manager_id: int, to_guideline_id: int, scope_item_ids=None
+    ) -> int:
+        manager = self.conn.execute("SELECT role FROM users WHERE id=?", (manager_id,)).fetchone()
+        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        to_guideline = self.conn.execute(
+            "SELECT * FROM guidelines WHERE id=? AND active=1", (to_guideline_id,)
+        ).fetchone()
+        if not manager or manager["role"] != "manager":
+            raise DomainError("管理员无效")
+        if not batch:
+            raise DomainError("批次不存在")
+        if batch["status"] == "frozen":
+            raise DomainError("冻结批次不能换版")
+        if not to_guideline:
+            raise DomainError("新指南不存在或未启用")
+        if self._pending_change(batch_id):
+            raise DomainError("该批次已有进行中的换版单，请先确认生效或取消")
+        items = self.conn.execute(
+            "SELECT id FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)
+        ).fetchall()
+        item_ids = [r["id"] for r in items]
+        if scope_item_ids is None or scope_item_ids == [] or scope_item_ids == "all":
+            scope_ids, scope_all = item_ids, 1
+        else:
+            try:
+                scope_ids = [int(x) for x in scope_item_ids]
+            except (TypeError, ValueError) as exc:
+                raise DomainError("适用条目范围无效") from exc
+            scope_all = 0
+            if any(i not in item_ids for i in scope_ids):
+                raise DomainError("适用范围包含不属于本批次的条目")
+        if not scope_ids:
+            raise DomainError("适用条目范围不能为空")
+        effective = self._effective_guidelines(batch_id)
+        from_ids = {effective.get(i, batch["guideline_id"]) for i in scope_ids}
+        if len(from_ids) != 1:
+            raise DomainError("范围内条目当前指南不一致，无法统一换版")
+        from_gid = next(iter(from_ids))
+        if from_gid == to_guideline_id:
+            raise DomainError("新指南与范围内条目当前指南相同，无需换版")
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO guideline_changes"
+                "(batch_id,from_guideline_id,to_guideline_id,scope_all,scope_item_ids,status,created_by,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    batch_id, from_gid, to_guideline_id, scope_all,
+                    json.dumps(scope_ids), "pending", manager_id, datetime.now().isoformat(),
+                ),
+            )
+        return int(cur.lastrowid)
+
+    def get_guideline_change(self, batch_id: int) -> dict:
+        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch:
+            raise DomainError("批次不存在")
+        change = self._pending_change(batch_id) or self.conn.execute(
+            "SELECT * FROM guideline_changes WHERE batch_id=? ORDER BY id DESC LIMIT 1", (batch_id,)
+        ).fetchone()
+        if not change:
+            return {"batch_id": batch_id, "change": None}
+        todos, all_ready = self._change_todos(change) if change["status"] == "pending" else ([], True)
+        return {
+            "batch_id": batch_id,
+            "batch_name": batch["name"],
+            "status": change["status"],
+            "revision": change["revision"],
+            "change": dict(change),
+            "from_guideline": self._guideline_brief(change["from_guideline_id"]),
+            "to_guideline": self._guideline_brief(change["to_guideline_id"]),
+            "scope_all": change["scope_all"],
+            "scope_item_ids": self._change_scope_ids(change),
+            "todos": todos,
+            "all_ready": all_ready,
+            "computed_at": datetime.now().isoformat(),
+        }
+
+    def confirm_guideline_change(self, batch_id: int, manager_id: int) -> dict:
+        """Apply a pending change. Idempotent: concurrent/retried confirmations record only one effective event."""
+        manager = self.conn.execute("SELECT role FROM users WHERE id=?", (manager_id,)).fetchone()
+        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not manager or manager["role"] != "manager":
+            raise DomainError("管理员无效")
+        if not batch:
+            raise DomainError("批次不存在")
+        with self.transaction():
+            pending = self.conn.execute(
+                "SELECT * FROM guideline_changes WHERE batch_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+            if not pending:
+                applied = self.conn.execute(
+                    "SELECT * FROM guideline_changes WHERE batch_id=? AND status='applied' ORDER BY id DESC LIMIT 1",
+                    (batch_id,),
+                ).fetchone()
+                if applied:
+                    return {"ok": True, "already_applied": True, "change": dict(applied)}
+                raise DomainError("没有进行中的换版单")
+            todos, all_ready = self._change_todos(pending)
+            if not all_ready:
+                outstanding = [t for t in todos if not t["ready"]]
+                detail = "；".join(f"条目 {t['ordinal']}: {', '.join(t['reasons'])}" for t in outstanding)
+                raise DomainError(f"待补标未完成，不能生效（{len(outstanding)} 条）：{detail}")
+            cur = self.conn.execute(
+                "UPDATE guideline_changes SET status='applied', applied_by=?, applied_at=?, version=version+1 "
+                "WHERE id=? AND status='pending' AND version=?",
+                (manager_id, datetime.now().isoformat(), pending["id"], pending["version"]),
+            )
+            if cur.rowcount == 0:
+                applied = self.conn.execute(
+                    "SELECT * FROM guideline_changes WHERE id=?", (pending["id"],)
+                ).fetchone()
+                return {"ok": True, "already_applied": True, "change": dict(applied)}
+            applied = self.conn.execute(
+                "SELECT * FROM guideline_changes WHERE id=?", (pending["id"],)
+            ).fetchone()
+        return {"ok": True, "already_applied": False, "change": dict(applied)}
+
+    def cancel_guideline_change(self, batch_id: int, manager_id: int) -> dict:
+        manager = self.conn.execute("SELECT role FROM users WHERE id=?", (manager_id,)).fetchone()
+        if not manager or manager["role"] != "manager":
+            raise DomainError("管理员无效")
+        with self.transaction():
+            pending = self.conn.execute(
+                "SELECT * FROM guideline_changes WHERE batch_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+            if not pending:
+                raise DomainError("没有进行中的换版单")
+            self.conn.execute(
+                "UPDATE guideline_changes SET status='cancelled', cancelled_by=?, cancelled_at=?, version=version+1 "
+                "WHERE id=? AND status='pending'",
+                (manager_id, datetime.now().isoformat(), pending["id"]),
+            )
+        return {"ok": True, "cancelled": pending["id"]}
+
     def snapshot(self) -> dict:
         return {
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "guideline_changes": [
+                dict(r) for r in self.conn.execute("SELECT * FROM guideline_changes ORDER BY id")
+            ],
         }
