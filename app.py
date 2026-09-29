@@ -59,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.db.consistency(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "gold":
                 return self._json(200, self.db.export_gold(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "guideline-change":
+                return self._json(200, self.db.guideline_change_status(int(parts[2])))
             self._json(404, {"ok": False, "error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -78,11 +80,42 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "assign":
                 return self._json(201, {"ok": True, "id": self.db.assign(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)))})
             if path == "/api/annotations":
-                return self._json(201, {"ok": True, "id": self.db.submit_annotation(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)), str(body.get("label", "")), str(body.get("comment", "")))})
+                return self._json(201, {"ok": True, "id": self.db.submit_annotation(
+                    int(body.get("item_id", 0)), int(body.get("annotator_id", 0)),
+                    str(body.get("label", "")), str(body.get("comment", "")),
+                    int(body.get("guideline_id", 0) or 0),
+                )})
             if path == "/api/adjudications":
-                return self._json(201, {"ok": True, "id": self.db.adjudicate(int(body.get("item_id", 0)), str(body.get("final_label", "")), str(body.get("reason", "")), int(body.get("arbitrator_id", 0)))})
+                return self._json(201, {"ok": True, "id": self.db.adjudicate(
+                    int(body.get("item_id", 0)), str(body.get("final_label", "")),
+                    str(body.get("reason", "")), int(body.get("arbitrator_id", 0)),
+                    int(body.get("guideline_id", 0) or 0),
+                )})
             if path == "/api/discussions":
                 return self._json(201, {"ok": True, "id": self.db.add_discussion(int(body.get("item_id", 0)), int(body.get("author_id", 0)), str(body.get("body", "")), bool(body.get("contains_answer", False)))})
+            if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3] == "guideline-change":
+                batch_id = int(parts[2])
+                action = parts[4]
+                if action == "submit":
+                    raw = body.get("item_ids")
+                    if raw is None:
+                        item_ids = None
+                    elif isinstance(raw, list):
+                        item_ids = [int(x) for x in raw]
+                    else:
+                        item_ids = [int(x) for x in str(raw).split(",") if str(x).strip()]
+                    return self._json(201, {"ok": True, **self.db.create_guideline_change(
+                        batch_id, int(body.get("manager_id", 0)),
+                        int(body.get("new_guideline_id", 0)), item_ids,
+                    )})
+                if action == "confirm":
+                    return self._json(200, {"ok": True, **self.db.confirm_guideline_change(
+                        batch_id, int(body.get("manager_id", 0)),
+                    )})
+                if action == "cancel":
+                    return self._json(200, {"ok": True, **self.db.cancel_guideline_change(
+                        batch_id, int(body.get("manager_id", 0)),
+                    )})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "freeze":
                 return self._json(200, {"ok": True, **self.db.freeze_batch(int(parts[2]), int(body.get("manager_id", 0)))})
             self._json(404, {"ok": False, "error": "接口不存在"})
